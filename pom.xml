@@ -6,15 +6,60 @@
 
     <groupId>isinsnap</groupId>
     <artifactId>isin-snap</artifactId>
-    <version>0.1.0</version>
+    <version>0.2.0</version>
     <packaging>jar</packaging>
     <name>ISIN Snap</name>
 
-    <!-- No dependencies: JDK only. OCR is done by the Tesseract executable. -->
+    <!--
+        Self-contained: Tesseract and Leptonica native libraries (via JavaCPP) and the English OCR model
+        are packed inside the jar. Nothing has to be installed on the target PC except Java
+        (and not even that when using the jpackage bundles built by CI).
+    -->
     <properties>
         <maven.compiler.release>17</maven.compiler.release>
         <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
+        <javacpp.version>1.5.13</javacpp.version>
+        <tesseract.version>5.5.2-${javacpp.version}</tesseract.version>
+        <leptonica.version>1.87.0-${javacpp.version}</leptonica.version>
     </properties>
+
+    <dependencies>
+        <!-- Java bindings -->
+        <dependency>
+            <groupId>org.bytedeco</groupId>
+            <artifactId>javacpp</artifactId>
+            <version>${javacpp.version}</version>
+        </dependency>
+        <dependency>
+            <groupId>org.bytedeco</groupId>
+            <artifactId>leptonica</artifactId>
+            <version>${leptonica.version}</version>
+        </dependency>
+        <dependency>
+            <groupId>org.bytedeco</groupId>
+            <artifactId>tesseract</artifactId>
+            <version>${tesseract.version}</version>
+        </dependency>
+
+        <!-- Native libraries, desktop platforms only (the *-platform artifacts would also drag in Android) -->
+        <dependency><groupId>org.bytedeco</groupId><artifactId>javacpp</artifactId><version>${javacpp.version}</version><classifier>windows-x86_64</classifier></dependency>
+        <dependency><groupId>org.bytedeco</groupId><artifactId>javacpp</artifactId><version>${javacpp.version}</version><classifier>macosx-x86_64</classifier></dependency>
+        <dependency><groupId>org.bytedeco</groupId><artifactId>javacpp</artifactId><version>${javacpp.version}</version><classifier>macosx-arm64</classifier></dependency>
+        <dependency><groupId>org.bytedeco</groupId><artifactId>javacpp</artifactId><version>${javacpp.version}</version><classifier>linux-x86_64</classifier></dependency>
+        <dependency><groupId>org.bytedeco</groupId><artifactId>javacpp</artifactId><version>${javacpp.version}</version><classifier>linux-arm64</classifier></dependency>
+
+        <dependency><groupId>org.bytedeco</groupId><artifactId>leptonica</artifactId><version>${leptonica.version}</version><classifier>windows-x86_64</classifier></dependency>
+        <dependency><groupId>org.bytedeco</groupId><artifactId>leptonica</artifactId><version>${leptonica.version}</version><classifier>macosx-x86_64</classifier></dependency>
+        <dependency><groupId>org.bytedeco</groupId><artifactId>leptonica</artifactId><version>${leptonica.version}</version><classifier>macosx-arm64</classifier></dependency>
+        <dependency><groupId>org.bytedeco</groupId><artifactId>leptonica</artifactId><version>${leptonica.version}</version><classifier>linux-x86_64</classifier></dependency>
+        <dependency><groupId>org.bytedeco</groupId><artifactId>leptonica</artifactId><version>${leptonica.version}</version><classifier>linux-arm64</classifier></dependency>
+
+        <dependency><groupId>org.bytedeco</groupId><artifactId>tesseract</artifactId><version>${tesseract.version}</version><classifier>windows-x86_64</classifier></dependency>
+        <dependency><groupId>org.bytedeco</groupId><artifactId>tesseract</artifactId><version>${tesseract.version}</version><classifier>macosx-x86_64</classifier></dependency>
+        <dependency><groupId>org.bytedeco</groupId><artifactId>tesseract</artifactId><version>${tesseract.version}</version><classifier>macosx-arm64</classifier></dependency>
+        <dependency><groupId>org.bytedeco</groupId><artifactId>tesseract</artifactId><version>${tesseract.version}</version><classifier>linux-x86_64</classifier></dependency>
+        <dependency><groupId>org.bytedeco</groupId><artifactId>tesseract</artifactId><version>${tesseract.version}</version><classifier>linux-arm64</classifier></dependency>
+    </dependencies>
 
     <build>
         <finalName>isin-snap</finalName>
@@ -30,6 +75,38 @@
                         </manifest>
                     </archive>
                 </configuration>
+            </plugin>
+            <!-- One runnable jar with everything inside -->
+            <plugin>
+                <groupId>org.apache.maven.plugins</groupId>
+                <artifactId>maven-shade-plugin</artifactId>
+                <version>3.6.0</version>
+                <executions>
+                    <execution>
+                        <phase>package</phase>
+                        <goals><goal>shade</goal></goals>
+                        <configuration>
+                            <createDependencyReducedPom>false</createDependencyReducedPom>
+                            <filters>
+                                <filter>
+                                    <artifact>*:*</artifact>
+                                    <excludes>
+                                        <exclude>META-INF/*.SF</exclude>
+                                        <exclude>META-INF/*.DSA</exclude>
+                                        <exclude>META-INF/*.RSA</exclude>
+                                        <exclude>META-INF/versions/**/module-info.class</exclude>
+                                        <exclude>module-info.class</exclude>
+                                    </excludes>
+                                </filter>
+                            </filters>
+                            <transformers>
+                                <transformer implementation="org.apache.maven.plugins.shade.resource.ManifestResourceTransformer">
+                                    <mainClass>isinsnap.IsinSnap</mainClass>
+                                </transformer>
+                            </transformers>
+                        </configuration>
+                    </execution>
+                </executions>
             </plugin>
         </plugins>
     </build>
