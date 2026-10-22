@@ -35,8 +35,6 @@ import java.awt.event.MouseAdapter;
 import java.awt.event.MouseEvent;
 import java.awt.image.BufferedImage;
 import java.io.File;
-import java.nio.file.Path;
-import java.util.Optional;
 
 /**
  * ISIN Snap: an always-on-top button (plus a system tray icon, where available).
@@ -49,23 +47,23 @@ import java.util.Optional;
  */
 public final class IsinSnap {
 
-    private final IsinScanner scanner;
+    private volatile IsinScanner scanner;   // created in the background at startup
     private JFrame launcher;
     private JButton button;
     private boolean busy;
-
-    private IsinSnap(IsinScanner scanner) { this.scanner = scanner; }
 
     public static void main(String[] args) throws Exception {
         if (args.length > 0 && args[0].equals("--selftest")) {
             System.exit(SelfTest.run() == 0 ? 0 : 1);
         }
-
-        Optional<Path> exe = TesseractOcr.locate();
-
+        if (args.length > 0 && args[0].equals("--version")) {
+            System.out.println("ISIN Snap - Tesseract " + TesseractOcr.version() + " (embedded)");
+            return;
+        }
         if (args.length > 1 && args[0].equals("--file")) {
-            if (exe.isEmpty()) { System.err.println(missingTesseractMessage()); System.exit(2); }
-            cli(new IsinScanner(new TesseractOcr(exe.get())), new File(args[1]));
+            try (IsinScanner scanner = new IsinScanner()) {
+                cli(scanner, new File(args[1]));
+            }
             return;
         }
 
@@ -75,16 +73,34 @@ public final class IsinSnap {
         }
         try { UIManager.setLookAndFeel(UIManager.getSystemLookAndFeelClassName()); } catch (Exception ignored) { }
 
-        if (exe.isEmpty()) {
-            SwingUtilities.invokeLater(() -> {
-                JOptionPane.showMessageDialog(null, missingTesseractMessage(), "ISIN Snap – Tesseract not found",
-                    JOptionPane.ERROR_MESSAGE);
-                System.exit(2);
-            });
-            return;
-        }
-        IsinSnap app = new IsinSnap(new IsinScanner(new TesseractOcr(exe.get())));
+        IsinSnap app = new IsinSnap();
         SwingUtilities.invokeLater(app::start);
+        app.loadOcr();
+    }
+
+    /** Loads the embedded OCR engines (natives + model) while the button is already on screen. */
+    private void loadOcr() {
+        Thread t = new Thread(() -> {
+            try {
+                IsinScanner s = new IsinScanner();
+                SwingUtilities.invokeLater(() -> {
+                    scanner = s;
+                    if (button != null) { button.setText("Scan ISIN"); button.setEnabled(true); }
+                });
+            } catch (Throwable e) {
+                e.printStackTrace();
+                SwingUtilities.invokeLater(() -> {
+                    JOptionPane.showMessageDialog(launcher,
+                        "Could not start the embedded OCR engine:\n" + e + "\n\n"
+                        + "If your PC blocks native libraries in the user profile, start the app with\n"
+                        + "-Dorg.bytedeco.javacpp.cachedir=<a folder where DLLs may run>.",
+                        "ISIN Snap", JOptionPane.ERROR_MESSAGE);
+                    System.exit(2);
+                });
+            }
+        }, "ocr-loader");
+        t.setDaemon(true);
+        t.start();
     }
 
     private static void cli(IsinScanner scanner, File file) throws Exception {
@@ -101,18 +117,6 @@ public final class IsinSnap {
         System.out.printf("# %d unique ISINs (%d duplicates merged) in %d ms%n", r.isins().size(), dup, r.millis());
     }
 
-    static String missingTesseractMessage() {
-        String os = System.getProperty("os.name", "").toLowerCase();
-        String how = os.contains("win")
-            ? "Windows: install Tesseract (UB Mannheim build) or copy a \"tesseract\" folder\n"
-              + "(with tesseract.exe and tessdata) next to isin-snap.jar."
-            : os.contains("mac")
-            ? "macOS: brew install tesseract"
-            : "Linux: sudo apt install tesseract-ocr";
-        return "Cannot find the Tesseract OCR executable.\n\n" + how
-            + "\n\nAlternatively, set the path with -Dtesseract.path=... or the TESSERACT_PATH variable.";
-    }
-
     // ───────────────────────────── UI ─────────────────────────────
 
     private void start() {
@@ -122,7 +126,8 @@ public final class IsinSnap {
         launcher.setType(Window.Type.UTILITY); // no taskbar icon on Windows
         launcher.setDefaultCloseOperation(JFrame.EXIT_ON_CLOSE);
 
-        button = new JButton("Scan ISIN");
+        button = new JButton(scanner != null ? "Scan ISIN" : "Loading OCR…");
+        button.setEnabled(scanner != null);
         button.setFont(button.getFont().deriveFont(Font.BOLD, 13f));
         button.setFocusPainted(false);
         button.setToolTipText("Select a screen area and recognize the ISINs · right-click for the menu");
@@ -211,7 +216,7 @@ public final class IsinSnap {
 
     /** Hides the button, waits until it is gone from the screen, then opens the selection. */
     private void scan() {
-        if (busy) return;
+        if (busy || scanner == null) return;
         busy = true;
         boolean wasVisible = launcher.isVisible();
         launcher.setVisible(false);

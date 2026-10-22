@@ -105,9 +105,10 @@ public final class IsinExtractor {
         }
         String forced = new String(normalized);
         if (plausible(forced)) {
-            // ISINs with few digits in the body are rare (even SEDOL-based ones like GB00BH4HKS39 have 4+),
-            // and they are exactly the ones where a letter/digit swap most easily yields another valid ISIN
-            Kind k = bodyDigits(forced) < 4 ? Kind.SUGGESTED : forced.equals(raw) ? Kind.EXACT : Kind.CORRECTED;
+            // ISINs with many letters in the body (5+ of 9) are rare (some SEDOL/WKN-based ones such as
+            // GB00BH4HKS39) and are exactly the ones the OCR misreads most, sometimes identically in two passes:
+            // they are always shown for review
+            Kind k = bodyDigits(forced) < 5 ? Kind.SUGGESTED : forced.equals(raw) ? Kind.EXACT : Kind.CORRECTED;
             return new Match(forced, k, raw, List.of());
         }
         String withLetters = new String(c);
@@ -228,11 +229,23 @@ public final class IsinExtractor {
             for (String line : text.split("\\R")) addLine(line.toUpperCase(Locale.ROOT));
             // every pass reads the same image: an ISIN's count is the highest count seen in any single pass
             passCounts.forEach((k, n) -> counts.merge(k, n, Math::max));
+            for (String k : passCounts.keySet()) support.merge(k, 1, Integer::sum);
+            passes++;
             this.trusted = true;
         }
 
         private boolean trusted = true;
         private final Map<String, Integer> passCounts = new HashMap<>();
+        /** In how many passes (of any kind) each ISIN was read. */
+        private final Map<String, Integer> support = new HashMap<>();
+        private int passes = 0;
+
+        /**
+         * With several passes, an ISIN is confident only if at least two independent passes read it
+         * (and at least one of them is a trusted pass, see {@link #addText(String, boolean)}):
+         * a single pass that misreads a character still has a 1-in-10 chance of a matching check digit.
+         */
+        static final int MIN_SUPPORT = 2;
         private final Map<String, Integer> counts = new HashMap<>();
 
         /** How many times this ISIN appears in the captured text (duplicates are merged into one row). */
@@ -312,6 +325,11 @@ public final class IsinExtractor {
          *    at the same spot) become a single AMBIGUOUS result: the checksum alone cannot tell which is right.
          */
         public List<Match> results() {
+            if (passes >= MIN_SUPPORT) {
+                for (Map.Entry<String, Match> e : byKey.entrySet()) {
+                    if (support.getOrDefault(e.getKey(), 0) < MIN_SUPPORT) e.setValue(demote(e.getValue()));
+                }
+            }
             List<Match> plain = new ArrayList<>();
             for (Match m : byKey.values()) if (m.kind() != Kind.AMBIGUOUS) plain.add(m);
             Set<String> seen = new LinkedHashSet<>();

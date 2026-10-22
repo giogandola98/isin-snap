@@ -1,0 +1,161 @@
+name: Build
+
+# Push/PR on main: tests on Windows, macOS and Linux (with NO Tesseract installed: the OCR is inside the jar).
+# If they pass: per-OS bundles with Java included, published as the "main-latest" pre-release (push to main)
+# or as a versioned release (v* tag).
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: build-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  jar:
+    name: Universal jar
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+          cache: maven
+      - name: Build
+        run: mvn -B -q package
+      - uses: actions/upload-artifact@v4
+        with:
+          name: jar
+          path: target/isin-snap.jar
+          if-no-files-found: error
+
+  test:
+    name: Test on ${{ matrix.os }}
+    needs: jar
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, windows-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+      - uses: actions/download-artifact@v4
+        with:
+          name: jar
+      - name: Tesseract must NOT be installed (proves the jar is self-contained)
+        run: |
+          if command -v tesseract; then echo "::error::tesseract found on this runner"; exit 1; fi
+      - name: Engine version
+        run: java -jar isin-snap.jar --version
+      - name: Self-test
+        run: java -jar isin-snap.jar --selftest
+      - name: OCR on the sample screenshot
+        run: |
+          java -jar isin-snap.jar --file samples/chat-bloomberg-simulated.png | tee ocr.txt
+          grep -q "# 11 unique ISINs" ocr.txt
+
+  bundle:
+    name: Bundle for ${{ matrix.platform }}
+    needs: test
+    if: github.event_name != 'pull_request'
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { os: windows-latest, platform: windows-x86_64, archive: ISINSnap-windows-x64.zip }
+          - { os: macos-latest,   platform: macosx-arm64,   archive: ISINSnap-macos-arm64.zip }
+          - { os: ubuntu-24.04,   platform: linux-x86_64,   archive: ISINSnap-linux-x64.tar.gz }
+    runs-on: ${{ matrix.os }}
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "21"
+      - uses: actions/download-artifact@v4
+        with:
+          name: jar
+          path: universal
+      - name: Keep only this platform's natives
+        run: |
+          mkdir pkg
+          python3 tools/slim_jar.py universal/isin-snap.jar pkg/isin-snap.jar ${{ matrix.platform }} || \
+            python tools/slim_jar.py universal/isin-snap.jar pkg/isin-snap.jar ${{ matrix.platform }}
+      - name: jpackage (app with its own Java runtime)
+        run: |
+          jpackage --type app-image --name ISINSnap \
+            --input pkg --main-jar isin-snap.jar --main-class isinsnap.IsinSnap \
+            --add-modules java.base,java.desktop,java.management,java.logging,jdk.unsupported \
+            --jlink-options "--strip-debug --no-header-files --no-man-pages" \
+            --dest bundle
+      - name: Smoke test the bundle (no Java, no Tesseract needed)
+        run: |
+          case "${{ runner.os }}" in
+            Windows) exe="bundle/ISINSnap/ISINSnap.exe"; jar="bundle/ISINSnap/app/isin-snap.jar"; java="bundle/ISINSnap/runtime/bin/java.exe" ;;
+            macOS)   exe=""; jar="bundle/ISINSnap.app/Contents/app/isin-snap.jar"; java="bundle/ISINSnap.app/Contents/runtime/Contents/Home/bin/java" ;;
+            *)       exe=""; jar="bundle/ISINSnap/lib/app/isin-snap.jar"; java="bundle/ISINSnap/lib/runtime/bin/java" ;;
+          esac
+          # the GUI launcher has no console on Windows: run the bundled runtime on the bundled jar instead
+          "$java" -jar "$jar" --file samples/chat-bloomberg-simulated.png | tee ocr.txt
+          grep -q "# 11 unique ISINs" ocr.txt
+      - name: Archive
+        run: |
+          cd bundle
+          if [ "${{ runner.os }}" = "Linux" ]; then tar czf ../${{ matrix.archive }} ISINSnap
+          elif [ "${{ runner.os }}" = "macOS" ]; then ditto -c -k --keepParent ISINSnap.app ../${{ matrix.archive }}
+          else 7z a -tzip -bso0 ../${{ matrix.archive }} ISINSnap; fi
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.archive }}
+          path: ${{ matrix.archive }}
+          if-no-files-found: error
+
+  publish:
+    name: Publish
+    needs: bundle
+    if: github.event_name == 'push'
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - name: Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          ls -la dist
+          files="dist/isin-snap.jar dist/ISINSnap-windows-x64.zip dist/ISINSnap-macos-arm64.zip dist/ISINSnap-linux-x64.tar.gz docs/demo.mp4"
+          notes="Nothing to install: the OCR engine is inside.
+          - **ISINSnap-windows-x64.zip / -macos-arm64.zip / -linux-x64.tar.gz**: unzip and run, Java included.
+          - **isin-snap.jar**: one file for every OS, needs Java 17+ (\`java -jar isin-snap.jar\`).
+          See the README for details."
+          if [ "${GITHUB_REF_TYPE}" = "tag" ]; then
+            gh release create "$GITHUB_REF_NAME" $files --title "ISIN Snap $GITHUB_REF_NAME" --notes "$notes"
+          else
+            gh release delete main-latest --yes --cleanup-tag || true
+            gh release create main-latest $files --prerelease --target "$GITHUB_SHA" \
+              --title "Latest build from main" \
+              --notes "Automatic build of ${GITHUB_SHA::7}, published because all tests passed on Windows, macOS and Linux.
+
+          $notes"
+          fi

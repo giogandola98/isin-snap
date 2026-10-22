@@ -5,8 +5,9 @@ the list of ISINs it contains, de-duplicated and ready to copy.
 
 ▶ **[Watch the 60-second demo](docs/demo.mp4)**
 
-- **Java 17+, zero dependencies.** OCR is done by [Tesseract](https://github.com/tesseract-ocr/tesseract),
-  called as an executable: no native libraries to load into Java, same behaviour on Windows, macOS and Linux.
+- **Nothing to install.** The OCR engine ([Tesseract](https://github.com/tesseract-ocr/tesseract) 5.5, via
+  [JavaCPP](https://github.com/bytedeco/javacpp-presets/tree/master/tesseract)) and its English model are inside
+  the app, for Windows, macOS and Linux. The per-OS downloads even include their own Java.
 - **Real validation.** Every ISIN is checked for ISO country prefix, format and check digit.
 - **OCR error correction**, with a clear indication of how much to trust each result (see below).
 - **De-duplication.** One row per ISIN, with a count of how many times it appears in the capture.
@@ -14,28 +15,31 @@ the list of ISINs it contains, de-duplicated and ready to copy.
 
 ## Download
 
-Ready-made builds are attached to the [GitHub Releases](../../releases) (`isin-snap.jar`).
-Every `v*` tag is built, self-tested and published automatically by GitHub Actions.
+From the [Releases](../../releases) page (`main-latest` = latest build of `main` that passed all tests):
 
-## Requirements
+| File | What you need | How to run |
+|---|---|---|
+| `ISINSnap-windows-x64.zip` | nothing | unzip, run `ISINSnap\ISINSnap.exe` |
+| `ISINSnap-macos-arm64.zip` | nothing (Apple Silicon) | unzip, right-click `ISINSnap.app` → Open the first time |
+| `ISINSnap-linux-x64.tar.gz` | nothing | extract, run `ISINSnap/bin/ISINSnap` |
+| `isin-snap.jar` | Java 17+ | `java -jar isin-snap.jar` (one file for Windows x64, macOS Intel/Apple Silicon, Linux x64/arm64) |
 
-- Java 17 or newer.
-- Tesseract 5:
+On first launch the native libraries are unpacked to `~/.javacpp/cache` and the OCR model to
+`~/.isin-snap/tessdata` (falls back to the temp folder if the home folder is not writable). If a corporate
+policy blocks DLLs in the user profile, point the cache elsewhere with
+`-Dorg.bytedeco.javacpp.cachedir=<folder>`.
 
-| OS | Tesseract |
-|---|---|
-| Windows | UB Mannheim installer (`tesseract-ocr-w64-setup-5.x.exe`), or a portable copy: a `tesseract\` folder with `tesseract.exe` and `tessdata\eng.traineddata` next to `isin-snap.jar` |
-| macOS | `brew install tesseract`, then on first run grant *Screen Recording* to Java/your terminal (System Settings → Privacy & Security) |
-| Linux | `sudo apt install tesseract-ocr` |
+macOS: on first use grant *Screen Recording* (System Settings → Privacy & Security), otherwise the
+capture only contains the wallpaper. The apps are not code-signed: Windows SmartScreen and macOS
+Gatekeeper may warn the first time.
 
-The app looks for Tesseract in this order: `-Dtesseract.path=…`, the `TESSERACT_PATH` variable,
-a `tesseract/` folder next to the jar, `PATH`, standard install locations (Homebrew included).
+## Build
 
-## Build and run
+Needs JDK 17+ and Maven (the build downloads the OCR libraries from Maven Central).
 
 ```bash
 ./build.sh                 # or .\build.ps1 on Windows, or: mvn package
-java -jar build/isin-snap.jar
+java -jar target/isin-snap.jar
 ```
 
 Other commands:
@@ -44,6 +48,7 @@ Other commands:
 java -jar isin-snap.jar --file screenshot.png              # analyse an image and print the ISINs
 java -Disinsnap.debug=true -jar isin-snap.jar --file x.png # also print the raw OCR text
 java -jar isin-snap.jar --selftest                         # check the recognition logic
+java -jar isin-snap.jar --version                          # embedded OCR engine version
 ```
 
 ## Usage
@@ -63,22 +68,23 @@ java -jar isin-snap.jar --selftest                         # check the recogniti
 
 | Status | Meaning | Pre-checked |
 |---|---|---|
-| Read | read as-is, check digit correct | yes |
+| Read | read as-is by at least two OCR passes, check digit correct | yes |
 | Corrected (safe fix) | deterministic fixes: `1T…`→`IT…`, last digit read as a letter, `O`/`I` in the body → `0`/`1` (WKN, SEDOL and CUSIP never use those letters) | yes |
-| Corrected: please check | valid only after changing an ambiguous body character (e.g. `8`↔`B`) | no |
+| Corrected: please check | valid only after changing an ambiguous body character (e.g. `8`↔`B`), read by a single OCR pass, or with 5+ letters in the body | no |
 | N variants: choose | several corrections are equally valid, or two OCR passes read different valid ISINs | no |
 | … · already copied | already copied earlier in this session | no |
 
 Why the caution: the check digit is *one* digit of redundancy. It catches almost every single error,
 but if you try many corrections, one in ten comes back valid by chance. In testing, freely correcting
 the body produced around 15% wrong ISINs presented as good ones. That is why body corrections are only
-suggested, never applied silently.
+suggested, never applied silently, and why an ISIN must be read by at least two of the four OCR passes
+to be pre-checked.
 
 ## How it works
 
 ```
 button → RegionSelector (frozen screenshot, physical pixels even on HiDPI/Retina)
-       → IsinScanner: several Tesseract passes in parallel (upscaling, dark themes inverted)
+       → IsinScanner: 4 embedded Tesseract engines in parallel (upscaling, dark themes inverted)
        → IsinExtractor: candidates → validation → corrections → merge passes → de-duplicate
        → ResultWindow
 ```
@@ -99,12 +105,12 @@ parentheses, mixed with prices, sizes and times. 498 ISINs in total.
 
 | | |
 |---|---|
-| Found and pre-checked | 95.6% |
-| Found as "needs review" | 3.4% |
-| Missed | 1.0% |
+| Found and pre-checked | 94.4% |
+| Found as "needs review" | 4.8% |
+| Missed | 0.8% |
 | **Wrong ISINs presented as confident** | **0** |
-| Spurious suggestions (not pre-checked) | 6 across 48 screenshots |
-| Average scan time | ~3.8 s on 2 cores (the 4 passes run in parallel: more cores, less time) |
+| Spurious suggestions (not pre-checked) | 7 across 48 screenshots |
+| Average scan time | ~1.3 s on 2 cores (engines stay loaded; the 4 passes run in parallel) |
 
 `samples/chat-bloomberg-simulated.png` is one of the test screenshots: `--file` finds 11 ISINs out of 11.
 
@@ -117,24 +123,24 @@ These are simulated screenshots: the real Bloomberg font is different. The first
 - **Linux Wayland**: capture goes through the system portal (needs JDK 21+ and a permission).
   X11 works directly.
 - **macOS**: without the *Screen Recording* permission the screenshot only contains the wallpaper.
-- **Corporate laptops**: check that installing Tesseract (or keeping a portable copy) and capturing
-  the screen are allowed by your policies.
+- **Corporate laptops**: nothing is installed, but check that running the app and capturing the screen
+  are allowed by your policies (see the note on native libraries under *Download*).
+- **Platforms**: Windows on ARM is not supported by the embedded OCR libraries. The macOS bundle is for
+  Apple Silicon; Intel Macs can use the jar with Java 17+.
 - The "already copied" list lives in memory and is cleared when the app restarts.
 
-## Packaging with a bundled JRE
+## CI and releases
+
+`.github/workflows/build.yml`, on every push and pull request to `main`:
+
+1. builds the universal jar;
+2. tests it on **Windows, macOS and Linux runners without Tesseract installed** (self-test + OCR on the
+   sample screenshot), which proves nothing external is needed;
+3. if all tests pass, builds the per-OS bundles with `jpackage` and smoke-tests each one;
+4. publishes everything: the `main-latest` pre-release for pushes to `main`, a versioned release for tags.
 
 ```bash
-jpackage --name "ISIN Snap" --input build --main-jar isin-snap.jar \
-         --main-class isinsnap.IsinSnap --type app-image
+git tag v0.3.0 && git push origin v0.3.0
 ```
 
-On Windows the `tesseract\` folder can go inside the app-image: a single folder to copy, nothing to install.
-
-## Releasing
-
-```bash
-git tag v0.2.0 && git push origin v0.2.0
-```
-
-The `Release` workflow builds the jar with Java 17, runs `--selftest` and creates the GitHub Release with
-`isin-snap.jar` and the demo video attached.
+`tools/slim_jar.py` strips the other platforms' natives from each bundle.

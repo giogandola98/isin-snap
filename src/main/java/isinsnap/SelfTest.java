@@ -51,6 +51,12 @@ public final class SelfTest {
         col.addText("IE00B4L5Y983");
         List<Match> merged = col.results();
         check("merge passes", merged.size() == 1 && merged.get(0).kind() == Kind.EXACT);
+        // Read by only one of two passes -> needs review, even if the check digit matches
+        IsinExtractor.Collector lone = new IsinExtractor.Collector();
+        lone.addText("US0378331005 IT0003132476");
+        lone.addText("US0378331005");
+        List<Match> l = lone.results();
+        check("two-pass agreement " + l, l.size() == 2 && l.get(0).kind() == Kind.EXACT && l.get(1).kind() == Kind.SUGGESTED);
         // Two passes read valid ISINs that differ only by 5/S -> conflict to review
         IsinExtractor.Collector conflict = new IsinExtractor.Collector();
         conflict.addText("IE00B4L5Y983");

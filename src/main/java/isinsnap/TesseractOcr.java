@@ -1,24 +1,30 @@
 package isinsnap;
 
-import javax.imageio.ImageIO;
+import org.bytedeco.javacpp.BytePointer;
+import org.bytedeco.tesseract.TessBaseAPI;
+
 import java.awt.image.BufferedImage;
-import java.io.File;
+import java.awt.image.DataBufferByte;
 import java.io.IOException;
 import java.io.InputStream;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.Paths;
-import java.util.ArrayList;
-import java.util.List;
-import java.util.Optional;
-import java.util.concurrent.TimeUnit;
+import java.nio.file.StandardCopyOption;
 
 /**
- * OCR through the Tesseract (5.x) executable, launched as a process.
- * No native library to load into Java: it works the same on Windows, macOS and Linux.
+ * Embedded OCR: Tesseract 5 called in-process through JavaCPP.
+ *
+ * Nothing has to be installed: the native libraries for Windows, macOS and Linux and the English
+ * model are inside the jar. JavaCPP extracts the right natives to its cache on first use
+ * (~/.javacpp/cache, override with -Dorg.bytedeco.javacpp.cachedir=...), and the model is extracted
+ * to ~/.isin-snap/tessdata.
+ *
+ * One instance = one configured Tesseract engine (page segmentation mode + whitelist). An engine is not
+ * thread-safe, so calls are serialized; run several instances to OCR in parallel.
  */
-public final class TesseractOcr {
+public final class TesseractOcr implements AutoCloseable {
 
     /**
      * Letters (lowercase too: in chats ISINs are typed any old way), digits and typical chat punctuation.
@@ -27,102 +33,94 @@ public final class TesseractOcr {
     public static final String WHITELIST =
         "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789/.,:;-()@%";
 
-    private final Path exe;
+    private static final String MODEL_RESOURCE = "/isinsnap/tessdata/eng.traineddata";
+    private static final int OEM_LSTM_ONLY = 1;
 
-    public TesseractOcr(Path exe) { this.exe = exe; }
+    private static volatile Path tessdataDir;
 
-    public Path executable() { return exe; }
-
-    /**
-     * Looks for tesseract in this order: -Dtesseract.path, TESSERACT_PATH variable,
-     * "tesseract" folder next to the jar (portable version), PATH, standard install locations.
-     */
-    public static Optional<Path> locate() {
-        boolean win = System.getProperty("os.name", "").toLowerCase().contains("win");
-        String name = win ? "tesseract.exe" : "tesseract";
-        List<Path> candidates = new ArrayList<>();
-
-        String prop = System.getProperty("tesseract.path");
-        if (prop != null && !prop.isBlank()) candidates.add(Paths.get(prop));
-        String env = System.getenv("TESSERACT_PATH");
-        if (env != null && !env.isBlank()) candidates.add(Paths.get(env));
-
-        appDir().ifPresent(d -> candidates.add(d.resolve("tesseract").resolve(name)));
-
-        String path = System.getenv("PATH");
-        if (path != null) for (String dir : path.split(File.pathSeparator)) {
-            if (!dir.isBlank()) candidates.add(Paths.get(dir, name));
-        }
-        if (win) {
-            for (String base : new String[]{ System.getenv("ProgramFiles"), System.getenv("ProgramFiles(x86)"),
-                                             System.getenv("LOCALAPPDATA") + "\\Programs" }) {
-                if (base != null) candidates.add(Paths.get(base, "Tesseract-OCR", name));
-            }
-        } else {
-            // GUI apps on macOS don't inherit the shell PATH: add Homebrew explicitly
-            candidates.add(Paths.get("/opt/homebrew/bin/tesseract"));
-            candidates.add(Paths.get("/usr/local/bin/tesseract"));
-            candidates.add(Paths.get("/usr/bin/tesseract"));
-        }
-        for (Path p : candidates) {
-            try {
-                // an environment variable may point to the folder instead of the executable
-                Path exe = Files.isDirectory(p) ? p.resolve(name) : p;
-                if (Files.isRegularFile(exe) && Files.isExecutable(exe)) return Optional.of(exe);
-            } catch (Exception ignored) { }
-        }
-        return Optional.empty();
-    }
-
-    private static Optional<Path> appDir() {
-        try {
-            Path jar = Paths.get(TesseractOcr.class.getProtectionDomain().getCodeSource().getLocation().toURI());
-            return Optional.of(Files.isDirectory(jar) ? jar : jar.getParent());
-        } catch (Exception e) {
-            return Optional.empty();
-        }
-    }
+    private final TessBaseAPI api = new TessBaseAPI();
+    private final int psm;
+    private final boolean whitelist;
 
     /**
      * @param psm        page segmentation mode (6 = block of text, 11 = sparse text, useful for tables)
      * @param whitelist  restricts the recognized characters (see WHITELIST)
      */
-    public String recognize(BufferedImage img, int psm, boolean whitelist) throws IOException, InterruptedException {
-        Path tmp = Files.createTempFile("isin-snap-", ".png");
+    public TesseractOcr(int psm, boolean whitelist) throws IOException {
+        this.psm = psm;
+        this.whitelist = whitelist;
+        if (api.Init(tessdata().toString(), "eng", OEM_LSTM_ONLY) != 0) {
+            api.close();
+            throw new IOException("Could not initialize the OCR engine (tessdata: " + tessdata() + ")");
+        }
+        api.SetPageSegMode(psm);
+        if (whitelist) api.SetVariable("tessedit_char_whitelist", WHITELIST);
+    }
+
+    /** Recognizes the text in an 8-bit grayscale image (see {@link ImagePrep}). */
+    public synchronized String recognize(BufferedImage gray) {
+        if (gray.getType() != BufferedImage.TYPE_BYTE_GRAY) throw new IllegalArgumentException("grayscale image expected");
+        byte[] pixels = ((DataBufferByte) gray.getRaster().getDataBuffer()).getData();
+        int w = gray.getWidth(), h = gray.getHeight();
+        api.SetImage(pixels, w, h, 1, w);
+        api.SetSourceResolution(300);
+        BytePointer text = api.GetUTF8Text();
         try {
-            ImageIO.write(img, "png", tmp.toFile());
-            List<String> cmd = new ArrayList<>(List.of(
-                exe.toString(), tmp.toString(), "stdout",
-                "-l", "eng", "--oem", "1", "--psm", String.valueOf(psm), "--dpi", "300"));
-            if (whitelist) {
-                cmd.add("-c");
-                cmd.add("tessedit_char_whitelist=" + WHITELIST);
-            }
-            ProcessBuilder pb = new ProcessBuilder(cmd);
-            pb.redirectError(ProcessBuilder.Redirect.DISCARD);
-            Process p = pb.start();
-            byte[] out;
-            try (InputStream in = p.getInputStream()) { out = in.readAllBytes(); }
-            if (!p.waitFor(60, TimeUnit.SECONDS)) {
-                p.destroyForcibly();
-                throw new IOException("Tesseract did not respond within 60 seconds");
-            }
-            if (p.exitValue() != 0) throw new IOException("Tesseract exited with code " + p.exitValue());
-            return new String(out, StandardCharsets.UTF_8);
+            return text == null ? "" : text.getString(StandardCharsets.UTF_8);
         } finally {
-            Files.deleteIfExists(tmp);
+            if (text != null) text.deallocate();
+            api.Clear();
         }
     }
 
+    public int psm() { return psm; }
+
+    public boolean whitelist() { return whitelist; }
+
+    @Override public synchronized void close() {
+        api.End();
+        api.close();
+    }
+
     /** Tesseract version, for diagnostics. */
-    public String version() {
-        try {
-            Process p = new ProcessBuilder(exe.toString(), "--version").redirectErrorStream(true).start();
-            String s = new String(p.getInputStream().readAllBytes(), StandardCharsets.UTF_8);
-            p.waitFor(10, TimeUnit.SECONDS);
-            return s.lines().findFirst().orElse("?");
-        } catch (Exception e) {
-            return "?";
+    public static String version() {
+        BytePointer v = TessBaseAPI.Version();
+        return v == null ? "?" : v.getString();
+    }
+
+    /** Extracts the embedded model once (re-extracted only if missing or of a different size). */
+    static Path tessdata() throws IOException {
+        Path dir = tessdataDir;
+        if (dir != null) return dir;
+        synchronized (TesseractOcr.class) {
+            if (tessdataDir != null) return tessdataDir;
+            String override = System.getProperty("isinsnap.tessdata");
+            if (override != null && !override.isBlank()) return tessdataDir = Paths.get(override);
+
+            byte[] model;
+            try (InputStream in = TesseractOcr.class.getResourceAsStream(MODEL_RESOURCE)) {
+                if (in == null) throw new IOException("OCR model missing from the jar: " + MODEL_RESOURCE);
+                model = in.readAllBytes();
+            }
+            IOException last = null;
+            for (Path base : new Path[] {
+                    Paths.get(System.getProperty("user.home"), ".isin-snap"),
+                    Paths.get(System.getProperty("java.io.tmpdir"), "isin-snap-" + System.getProperty("user.name")) }) {
+                try {
+                    Path d = base.resolve("tessdata");
+                    Path f = d.resolve("eng.traineddata");
+                    if (!Files.isRegularFile(f) || Files.size(f) != model.length) {
+                        Files.createDirectories(d);
+                        Path tmp = Files.createTempFile(d, "eng", ".tmp");
+                        Files.write(tmp, model);
+                        Files.move(tmp, f, StandardCopyOption.REPLACE_EXISTING, StandardCopyOption.ATOMIC_MOVE);
+                    }
+                    return tessdataDir = d;
+                } catch (IOException e) {
+                    last = e; // home not writable (some corporate setups): fall back to the temp folder
+                }
+            }
+            throw last;
         }
     }
 }
